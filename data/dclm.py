@@ -26,7 +26,7 @@ OUTPUT_FILE = 'dclm.json'
 CHECKPOINT_FILE = 'dclm_checkpoint.txt'
 
 # Target word count (3 billion)
-TARGET_WORDS = 3_000_000_000
+TARGET_WORDS = 300_000_000_000
 
 
 def count_words(text):

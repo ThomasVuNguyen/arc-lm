@@ -1,0 +1,1 @@
+{"last_index": 57041706, "total_words": 38176488737}
