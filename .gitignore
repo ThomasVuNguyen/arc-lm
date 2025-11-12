@@ -3,3 +3,5 @@
 */output/*.json
 */*.json
 output/.parquet_chunks/
+.env
+*.env
