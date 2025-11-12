@@ -32,12 +32,21 @@ DATA_CACHE_DIR = Path(__file__).resolve().parents[1] / "data" / "hf-cache"
 DATA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("HF_DATASETS_CACHE", str(DATA_CACHE_DIR))
 
-raw_dataset = load_dataset(
-    RAW_DATASET_NAME,
-    split="train",
-    cache_dir=str(DATA_CACHE_DIR),
-)
-raw_dataset = raw_dataset.shuffle(seed=42)
+raw_dataset_path = DATA_CACHE_DIR / "arc_raw"
+
+if raw_dataset_path.exists():
+    raw_dataset = load_dataset(
+        raw_dataset_path.as_posix(),
+        split="train",
+    )
+else:
+    raw_dataset = load_dataset(
+        RAW_DATASET_NAME,
+        split="train",
+        cache_dir=str(DATA_CACHE_DIR),
+    )
+    raw_dataset = raw_dataset.shuffle(seed=42)
+    raw_dataset.save_to_disk(raw_dataset_path.as_posix())
 
 def format_prompt(example):
     """
@@ -56,15 +65,23 @@ def format_prompt(example):
     )
     return {"text": conversation}
 
-original_columns = raw_dataset.column_names
-dataset = raw_dataset.map(
-    format_prompt,
-    remove_columns=original_columns,
-    desc="Formatting prompts",
-)
+formatted_path = DATA_CACHE_DIR / "arc_formatted"
 
-if len(dataset) == 0:
-    raise ValueError("Dataset is empty after formatting; please verify the source dataset.")
+if formatted_path.exists():
+    dataset = load_dataset(
+        formatted_path.as_posix(),
+        split="train",
+    )
+else:
+    original_columns = raw_dataset.column_names
+    dataset = raw_dataset.map(
+        format_prompt,
+        remove_columns=original_columns,
+        desc="Formatting prompts",
+    )
+    if len(dataset) == 0:
+        raise ValueError("Dataset is empty after formatting; please verify the source dataset.")
+    dataset.save_to_disk(formatted_path.as_posix())
 
 print(dataset[0]["text"])
 
