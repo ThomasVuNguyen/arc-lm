@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
-Stream and filter bigcode/the-stack-dedup dataset
-Filters for Python, C, C++, and JavaScript code
-Outputs separate JSON files for each language
+Stream and filter the bigcode/the-stack-dedup dataset.
+Filters for Python, C, C++, and JavaScript code and writes each language to
+its own JSONL file by sharding the dataset across worker processes.
 """
 
 import json
 import os
+import shutil
+import tempfile
 import time
 from collections import defaultdict
-from multiprocessing import Pool, Manager, cpu_count
+from multiprocessing import cpu_count, get_context
+
 from datasets import load_dataset
+
+try:
+    import orjson  # type: ignore
+except ImportError:  # orjson is optional but faster when available
+    orjson = None
 
 
 # Language mappings for the dataset
@@ -21,216 +29,225 @@ LANGUAGE_FILTER = {
     'JavaScript': 'js.json'
 }
 
-
-def process_batch(batch_data):
-    """Process a batch of rows and categorize by language"""
-    lang_data = defaultdict(list)
-
-    for item in batch_data:
-        lang = item.get('lang', '')
-
-        # Check if the language is one we want
-        if lang in LANGUAGE_FILTER:
-            filtered_item = {
-                'lang': lang,
-                'content': item.get('content', ''),
-                'stars': item.get('max_stars_count', 0)
-            }
-            lang_data[lang].append(filtered_item)
-
-    return lang_data
+# Tunables – adjust to match machine characteristics
+WRITE_BUFFER_SIZE = 1000        # Number of records to batch before flushing per lang
+PROGRESS_INTERVAL = 20000       # Worker rows processed between progress reports
+REPORT_STEP = 50000             # Rows between aggregated progress prints
 
 
-def write_batch_to_files(lang_data, output_dir='output', file_locks=None):
-    """Write categorized data to respective JSON files incrementally"""
-    os.makedirs(output_dir, exist_ok=True)
-
-    for lang, items in lang_data.items():
-        if items:
-            output_file = os.path.join(output_dir, LANGUAGE_FILTER[lang])
-            lock = file_locks.get(lang) if file_locks else None
-
-            # Thread-safe file writing
-            if lock:
-                lock.acquire()
-            try:
-                with open(output_file, 'a', encoding='utf-8') as f:
-                    for item in items:
-                        f.write(json.dumps(item, ensure_ascii=False) + '\n')
-                    f.flush()  # Ensure data is written to disk immediately
-            finally:
-                if lock:
-                    lock.release()
+def serialize_filtered_item(lang, item):
+    """Serialize filtered record using orjson when available."""
+    filtered_item = {
+        'lang': lang,
+        'content': item.get('content', ''),
+        'stars': item.get('max_stars_count', 0)
+    }
+    if orjson:
+        return orjson.dumps(filtered_item).decode('utf-8')
+    return json.dumps(filtered_item, ensure_ascii=False, separators=(',', ':'))
 
 
-def process_and_write_batch(batch_data, output_dir, file_locks):
-    """Process a batch and write results to files (for parallel execution)"""
-    lang_data = process_batch(batch_data)
-    write_batch_to_files(lang_data, output_dir, file_locks)
-    
-    # Return counts for statistics
-    counts = {}
-    for lang, items in lang_data.items():
-        counts[lang] = len(items)
-    return counts, len(batch_data)
+def flush_buffer(handle, buffer):
+    """Flush buffered lines to disk."""
+    if not buffer:
+        return
+    handle.write('\n'.join(buffer))
+    handle.write('\n')
+    buffer.clear()
+
+
+def worker_process(worker_id, num_workers, temp_dir, buffer_limit, progress_queue, progress_interval):
+    """
+    Stream a dataset shard inside the worker so we avoid shipping data over IPC.
+    Each worker writes to its own temp file per language to keep IO contention low.
+    """
+    dataset = load_dataset(
+        'bigcode/the-stack-dedup',
+        split='train',
+        streaming=True
+    )
+    shard = dataset.shard(num_shards=num_workers, index=worker_id)
+
+    file_handles = {}
+    buffers = {}
+    for lang in LANGUAGE_FILTER:
+        temp_file = os.path.join(temp_dir, f"{lang}_{worker_id}.jsonl")
+        file_handles[lang] = open(temp_file, 'a', encoding='utf-8', buffering=1024 * 1024)
+        buffers[lang] = []
+
+    processed_since = 0
+    filtered_since = 0
+    lang_since = defaultdict(int)
+
+    def emit_progress():
+        nonlocal processed_since, filtered_since, lang_since
+        if processed_since or filtered_since:
+            progress_queue.put((
+                'progress',
+                processed_since,
+                filtered_since,
+                dict(lang_since)
+            ))
+            processed_since = 0
+            filtered_since = 0
+            lang_since = defaultdict(int)
+
+    try:
+        for item in shard:
+            processed_since += 1
+            lang = item.get('lang')
+
+            if lang in LANGUAGE_FILTER:
+                buffers[lang].append(serialize_filtered_item(lang, item))
+                lang_since[lang] += 1
+                filtered_since += 1
+
+                if len(buffers[lang]) >= buffer_limit:
+                    flush_buffer(file_handles[lang], buffers[lang])
+
+            if processed_since >= progress_interval:
+                emit_progress()
+    except Exception as exc:  # Relay error to parent so it can abort cleanly
+        progress_queue.put(('error', worker_id, repr(exc)))
+        raise
+    finally:
+        for lang in LANGUAGE_FILTER:
+            flush_buffer(file_handles[lang], buffers[lang])
+            file_handles[lang].close()
+        emit_progress()
+        progress_queue.put(('done', worker_id))
+
+
+def merge_temp_files(temp_dir, output_dir):
+    """Merge all temp files into final output files (fast sequential merge)."""
+    print("\nMerging temp files into final output files...")
+    merge_start = time.time()
+
+    # Group temp files by language
+    lang_files = defaultdict(list)
+    for filename in os.listdir(temp_dir):
+        if filename.endswith('.jsonl'):
+            for lang in LANGUAGE_FILTER:
+                prefix = f"{lang}_"
+                if filename.startswith(prefix):
+                    lang_files[lang].append(os.path.join(temp_dir, filename))
+                    break
+
+    # Merge files for each language
+    for lang, temp_files in lang_files.items():
+        output_file = os.path.join(output_dir, LANGUAGE_FILTER[lang])
+        print(f"  Merging {len(temp_files)} files for {lang}...")
+
+        with open(output_file, 'w', encoding='utf-8', buffering=1024 * 1024) as outfile:
+            for temp_file in sorted(temp_files):
+                try:
+                    with open(temp_file, 'r', encoding='utf-8', buffering=1024 * 1024) as infile:
+                        shutil.copyfileobj(infile, outfile)
+                except Exception as exc:
+                    print(f"    Warning: Error reading {temp_file}: {exc}")
+
+    print("  Cleaning up temp files...")
+    shutil.rmtree(temp_dir)
+
+    merge_time = time.time() - merge_start
+    print(f"  Merge completed in {merge_time:.1f} seconds")
 
 
 def main():
     print("Starting to stream bigcode/the-stack-dedup dataset...")
     print(f"Filtering for languages: {', '.join(LANGUAGE_FILTER.keys())}")
-    print(f"Using {cpu_count()} CPU cores for processing")
 
-    # Create output directory
+    num_workers = cpu_count()
+    print(f"Using {num_workers} worker processes (dataset sharded per worker)")
+
     output_dir = 'output'
     os.makedirs(output_dir, exist_ok=True)
 
-    # Clear existing output files
     for filename in LANGUAGE_FILTER.values():
         filepath = os.path.join(output_dir, filename)
         if os.path.exists(filepath):
             os.remove(filepath)
             print(f"Cleared existing file: {filepath}")
 
-    # Create Manager for shared locks
-    manager = Manager()
-    file_locks = {lang: manager.Lock() for lang in LANGUAGE_FILTER.keys()}
+    temp_dir = tempfile.mkdtemp(prefix='tiny-stack-temp-')
+    print(f"Using temp directory: {temp_dir}")
 
-    # Create process pool with all CPU cores
-    num_cores = cpu_count()
-    pool = Pool(processes=num_cores)
+    ctx = get_context('spawn')
+    progress_queue = ctx.Queue(maxsize=num_workers * 4)
 
-    try:
-        # Stream the dataset
-        dataset = load_dataset(
-            'bigcode/the-stack-dedup',
-            split='train',
-            streaming=True
+    workers = []
+    for worker_id in range(num_workers):
+        proc = ctx.Process(
+            target=worker_process,
+            args=(worker_id, num_workers, temp_dir, WRITE_BUFFER_SIZE, progress_queue, PROGRESS_INTERVAL),
+            daemon=True
         )
+        proc.start()
+        workers.append(proc)
 
-        batch_size = 1000  # Process 1000 rows at a time
-        batch = []
-        total_processed = 0
-        total_filtered = 0
-        lang_counts = defaultdict(int)
+    total_processed = 0
+    total_filtered = 0
+    lang_counts = defaultdict(int)
+    error_messages = []
+    finished_workers = 0
+    start_time = time.time()
+    next_report = REPORT_STEP
 
-        # Time tracking for ETA
-        start_time = time.time()
+    print("\nProcessing dataset (progress aggregated across workers)...\n")
 
-        # Pending async results
-        pending_results = []
+    while finished_workers < num_workers:
+        message = progress_queue.get()
+        kind = message[0]
 
-        print("\nProcessing dataset...")
-        print("Data is being written incrementally to JSON files as processing occurs.\n")
+        if kind == 'progress':
+            _, processed_delta, filtered_delta, lang_delta = message
+            total_processed += processed_delta
+            total_filtered += filtered_delta
+            for lang, count in lang_delta.items():
+                lang_counts[lang] += count
 
-        for idx, item in enumerate(dataset):
-            batch.append(item)
+            if total_processed >= next_report:
+                elapsed = time.time() - start_time
+                rows_per_sec = total_processed / elapsed if elapsed > 0 else 0
+                print(f"[{time.strftime('%H:%M:%S')}] Processed: {total_processed:,} rows "
+                      f"| Filtered: {total_filtered:,} rows | Speed: {rows_per_sec:,.1f} rows/sec")
+                for lang, count in sorted(lang_counts.items()):
+                    print(f"  {lang}: {count:,}")
+                next_report += REPORT_STEP
 
-            if len(batch) >= batch_size:
-                # Submit batch to process pool for parallel processing
-                async_result = pool.apply_async(
-                    process_and_write_batch,
-                    (batch.copy(), output_dir, file_locks)
-                )
-                pending_results.append(async_result)
-                batch = []
+        elif kind == 'error':
+            _, worker_id, details = message
+            error_messages.append(f"Worker {worker_id} error: {details}")
 
-                # Process completed results (non-blocking check)
-                completed = []
-                for i, result in enumerate(pending_results):
-                    if result.ready():
-                        completed.append(i)
-                        try:
-                            counts, batch_len = result.get()
-                            total_processed += batch_len
-                            
-                            # Update counts
-                            for lang, count in counts.items():
-                                lang_counts[lang] += count
-                                total_filtered += count
-                        except Exception as e:
-                            print(f"Error processing batch: {e}")
+        elif kind == 'done':
+            finished_workers += 1
 
-                # Remove completed results (in reverse to maintain indices)
-                for i in reversed(completed):
-                    pending_results.pop(i)
+    for proc in workers:
+        proc.join()
 
-                # Print progress every 10k rows with ETA
-                if total_processed % 10000 == 0:
-                    current_time = time.time()
-                    elapsed = current_time - start_time
-                    rows_per_sec = total_processed / elapsed if elapsed > 0 else 0
+    if error_messages:
+        # Clean up temp directory if something went wrong
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        raise RuntimeError("Processing failed:\n" + "\n".join(error_messages))
 
-                    # Calculate ETA (rough estimate based on current rate)
-                    # Note: Since this is a streaming dataset, we don't know total size
-                    # So we show processing rate instead
-                    eta_str = f"{rows_per_sec:.1f} rows/sec"
+    merge_temp_files(temp_dir, output_dir)
 
-                    print(f"\n[{time.strftime('%H:%M:%S')}] Processed: {total_processed:,} rows | Filtered: {total_filtered:,} rows")
-                    print(f"  Speed: {eta_str} | Elapsed: {elapsed/60:.1f} min | Pending batches: {len(pending_results)}")
-                    for lang, count in sorted(lang_counts.items()):
-                        print(f"  {lang}: {count:,}")
+    end_time = time.time()
+    total_elapsed = end_time - start_time
+    avg_rate = total_processed / total_elapsed if total_elapsed > 0 else 0
 
-        # Process remaining batch
-        if batch:
-            async_result = pool.apply_async(
-                process_and_write_batch,
-                (batch, output_dir, file_locks)
-            )
-            pending_results.append(async_result)
-
-        # Wait for all pending results to complete
-        print("\nWaiting for all batches to complete...")
-        for result in pending_results:
-            try:
-                counts, batch_len = result.get()
-                total_processed += batch_len
-                
-                # Update counts
-                for lang, count in counts.items():
-                    lang_counts[lang] += count
-                    total_filtered += count
-            except Exception as e:
-                print(f"Error processing batch: {e}")
-
-        # Close and join the pool
-        pool.close()
-        pool.join()
-
-        # Final summary
-        end_time = time.time()
-        total_elapsed = end_time - start_time
-        avg_rate = total_processed / total_elapsed if total_elapsed > 0 else 0
-
-        print("\n" + "="*60)
-        print("Processing Complete!")
-        print("="*60)
-        print(f"Total rows processed: {total_processed:,}")
-        print(f"Total rows filtered: {total_filtered:,}")
-        print(f"Total time elapsed: {total_elapsed/60:.1f} minutes")
-        print(f"Average speed: {avg_rate:.1f} rows/sec")
-        print("\nBreakdown by language:")
-        for lang, count in sorted(lang_counts.items()):
-            filename = LANGUAGE_FILTER[lang]
-            print(f"  {lang}: {count:,} rows -> {os.path.join(output_dir, filename)}")
-
-    except KeyboardInterrupt:
-        pool.terminate()
-        pool.join()
-        end_time = time.time()
-        total_elapsed = end_time - start_time
-        print("\n\nProcess interrupted by user.")
-        print(f"Processed {total_processed:,} rows in {total_elapsed/60:.1f} minutes before interruption.")
-        print(f"Filtered {total_filtered:,} rows total.")
-        if lang_counts:
-            print("\nData saved by language:")
-            for lang, count in sorted(lang_counts.items()):
-                filename = LANGUAGE_FILTER[lang]
-                print(f"  {lang}: {count:,} rows -> {os.path.join(output_dir, filename)}")
-    except Exception as e:
-        pool.terminate()
-        pool.join()
-        print(f"\nError occurred: {e}")
-        raise
+    print("\n" + "=" * 60)
+    print("Processing Complete!")
+    print("=" * 60)
+    print(f"Total rows processed: {total_processed:,}")
+    print(f"Total rows filtered: {total_filtered:,}")
+    print(f"Total time elapsed: {total_elapsed / 60:.1f} minutes")
+    print(f"Average speed: {avg_rate:,.1f} rows/sec")
+    print("\nBreakdown by language:")
+    for lang, count in sorted(lang_counts.items()):
+        filename = LANGUAGE_FILTER[lang]
+        print(f"  {lang}: {count:,} rows -> {os.path.join(output_dir, filename)}")
 
 
 if __name__ == '__main__':
