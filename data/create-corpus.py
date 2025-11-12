@@ -41,11 +41,14 @@ dclm_dataset = dclm_dataset.remove_columns([col for col in dclm_dataset.column_n
 fineweb_dataset = fineweb_dataset.remove_columns([col for col in fineweb_dataset.column_names if col != "text"])
 
 # Interleave the datasets with specified probabilities
+# Using 'all_exhausted' strategy to include all data from all datasets
+# Smaller datasets (C) will be cycled to match larger ones
 print("Interleaving datasets...")
 mixed = interleave_datasets(
     [c_dataset, cpp_dataset, dclm_dataset, fineweb_dataset],
     probabilities=[0.17, 0.3, 0.25, 0.28],
-    seed=42
+    seed=42,
+    stopping_strategy="all_exhausted"
 )
 
 # Save the mixed dataset as a parquet file
