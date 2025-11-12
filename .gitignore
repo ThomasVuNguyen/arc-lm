@@ -7,3 +7,4 @@ output/.parquet_chunks/
 *.env
 train/output/
 train/tokenizers/
+data/hf-cache/

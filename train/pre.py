@@ -28,20 +28,16 @@ def load_hf_token():
 HF_TOKEN = load_hf_token()
 
 RAW_DATASET_NAME = "ThomasTheMaker/Arc-Corpus"
+DATA_CACHE_DIR = Path(__file__).resolve().parents[1] / "data" / "hf-cache"
+DATA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("HF_DATASETS_CACHE", str(DATA_CACHE_DIR))
 
-tokenizer_corpus = load_dataset(
+raw_dataset = load_dataset(
     RAW_DATASET_NAME,
     split="train",
-    streaming=True,
+    cache_dir=str(DATA_CACHE_DIR),
 )
-tokenizer_corpus = tokenizer_corpus.shuffle(buffer_size=1_000_000, seed=1234)
-
-dataset = load_dataset(
-    RAW_DATASET_NAME,
-    split="train",
-    streaming=True,
-)
-dataset = dataset.shuffle(buffer_size=1_000_000, seed=42)
+raw_dataset = raw_dataset.shuffle(seed=42)
 
 def format_prompt(example):
     """
@@ -60,20 +56,20 @@ def format_prompt(example):
     )
     return {"text": conversation}
 
-original_columns = dataset.column_names
-dataset = dataset.map(
+original_columns = raw_dataset.column_names
+dataset = raw_dataset.map(
     format_prompt,
     remove_columns=original_columns,
+    desc="Formatting prompts",
 )
 
-try:
-    sample = next(iter(dataset.take(1)))
-    print(sample["text"])
-except StopIteration:
+if len(dataset) == 0:
     raise ValueError("Dataset is empty after formatting; please verify the source dataset.")
 
+print(dataset[0]["text"])
+
 def get_training_corpus():
-    for row in tokenizer_corpus:
+    for row in raw_dataset:
         text = (row.get("text") or "").strip()
         if text:
             yield text
@@ -96,11 +92,12 @@ base_tokenizer = AutoTokenizer.from_pretrained(
     use_fast=True,
 )
 
-# Re-train the TinyLlama tokenizer on the Arc corpus so it stays architecture-compatible.
-tokenizer = base_tokenizer.train_new_from_iterator(
-    training_corpus,
-    vocab_size=TARGET_VOCAB_SIZE,
-)
+# Use the default TinyLlama tokenizer (training disabled to save memory).
+# tokenizer = base_tokenizer.train_new_from_iterator(
+#     training_corpus,
+#     vocab_size=TARGET_VOCAB_SIZE,
+# )
+tokenizer = base_tokenizer
 
 if not isinstance(tokenizer, PreTrainedTokenizerFast):
     raise ValueError("Expected a fast tokenizer to attach chat template metadata.")
@@ -181,6 +178,7 @@ sft_config = SFTConfig(
     lr_scheduler_type="cosine",
     warmup_ratio=0.03,
     optim="adamw_torch",
+    bf16=True,
     logging_steps=100,
     save_strategy="steps",
     save_steps=5_000,
