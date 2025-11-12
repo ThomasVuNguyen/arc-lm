@@ -2,3 +2,4 @@
 */__pycache__/
 */output/*.json
 */*.json
+output/.parquet_chunks/
