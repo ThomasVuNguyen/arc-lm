@@ -15,6 +15,7 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
 if not HF_TOKEN:
@@ -210,6 +211,11 @@ running_loss = 0.0
 start_time = time.time()
 window_start_time = time.time()
 window_start_step = 0
+
+loss_history = []
+lr_history = []
+throughput_history = []
+step_history = []
 
 def multi_epoch_stream(base_stream, num_epochs, max_rows):
     for epoch in range(num_epochs):
