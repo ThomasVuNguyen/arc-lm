@@ -8,3 +8,4 @@ output/.parquet_chunks/
 train/output/
 train/tokenizers/
 data/hf-cache/
+train/arc*/

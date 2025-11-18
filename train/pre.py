@@ -23,7 +23,7 @@ if not HF_TOKEN:
 
 RAW_DATASET_NAME = "ThomasTheMaker/Arc-Corpus"
 TOKENIZER_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-MAX_DATASET_ROWS = 1_200_000
+MAX_DATASET_ROWS = 9600_000
 
 OUTPUT_DIR = "output_arc_lm_100m"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
