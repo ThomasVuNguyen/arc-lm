@@ -12,3 +12,4 @@ data/hf-cache/
 train/arc*/
 venv/
 experiments/*parquet
+output/*
