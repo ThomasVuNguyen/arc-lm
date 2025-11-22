@@ -4,6 +4,7 @@ import math
 import time
 import random
 import yaml
+import shutil
 from itertools import islice, chain
 
 import numpy as np
@@ -30,10 +31,15 @@ pretrain_config = config["pretrain"]
 model_config = pretrain_config["model"]["config"]
 datasets_config = pretrain_config["dataset"]
 training_config = pretrain_config["training"]
+model_name = pretrain_config["model"]["name"]
 
 TOKENIZER_NAME = training_config["tokenizer"]
-OUTPUT_DIR = training_config["output_dir"]
+OUTPUT_DIR = os.path.join("output", model_name)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Copy config to output directory
+shutil.copy("config.yaml", os.path.join(OUTPUT_DIR, "config.yaml"))
+print(f"[*] Output directory: {OUTPUT_DIR}")
 
 BLOCK_SIZE = model_config.get("max_position_embeddings", 2048)
 BATCH_SIZE = training_config["batch_size"]
